@@ -29,37 +29,58 @@ A human-like conversation should go both ways:
 ```
 每 5 分钟触发一次 / Tick every 5 minutes
   │
-  ├─ 安静时段？         → 跳过（跳过（默认 23:00~07:30）
+  ├─ 安静时段？         → 跳过（默认 23:00~07:30）
   ├─ Quiet hours?       → Skip
-  ├─ 还在冷却期？        → 跳过（发完后随机冷却 5~90 分钟）
-  ├─ Still cooling down? → Skip (random 5~90 min cooldown)
+  ├─ 还在冷却期？        → 跳过（发完后随机冷却 15~45 分钟）
+  ├─ Still cooling down? → Skip (random 15~45 min cooldown)
   ├─ 用户最近有消息？     → 跳过（不打扰正在聊天的用户）
   ├─ User recently active? → Skip (don't interrupt)
   │
-  ├─ 概率衰减 / Probability decay
-  │   连续未回复 0 次/unanswered=0 → 60%
-  │   连续未回复 1 次/unanswered=1 → 30%
-  │   连续未回复 2 次/unanswered=2 → 15%
-  │   连续未回复 ≥4 次/unanswered≥4 → 3%
-  │
-  └─ LLM 决定 / LLM decides
-       DeepSeek 看当前上下文 + 时间 → 决定发不发、发什么
-       DeepSeek reads context + time → decides whether to send & what to say
-       原则：不问候、不废话、直接抛观点
-       Rule: no greetings, no fluff, just opinions
+  └─ 6 维权重决策 / 6-Dimension Weighted Decision
+       ┌─────────────────────────────────────────────┐
+       │ 冷却因子  × 0.25  上次发送后过了多久         │
+       │ 活跃因子  × 0.25  用户沉默了多久             │
+       │ 耐心衰减  × 0.20  连续未回复了几次           │
+       │ 语境深度  × 0.10  会话话题是否丰富           │
+       │ 时间适宜  × 0.10  当前时段是否适合说话       │
+       │ 信息信号  × 0.10  预留扩展（新闻/股价等）   │
+       └───────────────┬─────────────────────────────┘
+                       │
+                   总分 ≥ 0.55？
+                  /             \
+                是               否
+                │                └─ 跳过
+        LLM 生成内容
+        （只负责说什么，不决定发不发）
+                │
+             发送
 ```
 
-### 核心机制：概率衰减 / Core Mechanism
+### 核心机制：6 维权重决策 / Core Mechanism
 
-> **如果你连续不回，AI 会越来越不想打扰你。**
-> 一旦你回了一句，立刻重置到最活跃状态。
+> **多维度评分，纯数学计算决定"发不发"，LLM 只负责"发什么"。**
 >
-> **The more you ignore it, the quieter it gets.**
-> One reply from you resets it to full eagerness.
+> **Multi-dimension scoring: pure math decides IF to send, LLM only decides WHAT.**
 
-AI 不是定时炸弹，它懂得看眼色。
+大部分 tick 在评分阶段就被筛掉，不调 LLM，节省 token。
 
-It's not a nagging timer — it reads the room.
+Most ticks are filtered out at the scoring stage without calling the LLM at all.
+
+### 调试 / Debug
+
+```bash
+# 查看实时决策分数
+python3 proactive_send.py --dry-run
+
+# 输出示例 / Example output
+# [DECISION] total=0.64 threshold=0.55 => SEND
+#   cooldown:  0.25 * 1.00  = 0.2500
+#   activity:  0.25 * 0.80  = 0.2000
+#   context:   0.10 * 0.60  = 0.0600
+#   patience:  0.20 * 0.70  = 0.1400
+#   time:      0.10 * 0.60  = 0.0600
+#   info:      0.10 * 0.00  = 0.0000
+```
 
 ---
 
