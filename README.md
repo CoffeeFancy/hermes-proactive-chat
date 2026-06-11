@@ -50,7 +50,7 @@
 ### 安装
 
 ```bash
-git clone https://github.com/your-username/hermes-proactive-chat.git
+git clone https://github.com/CoffeeFancy/hermes-proactive-chat.git
 cd hermes-proactive-chat
 
 # 配置 API Key
