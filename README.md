@@ -65,10 +65,22 @@ It's not a nagging timer — it reads the room.
 
 ## 快速开始 / Quick Start
 
-### 依赖 / Dependencies
+### 如果你有 Hermes Agent / If You Have Hermes
+
+**一条命令安装（推荐）：**
+
+```bash
+hermes skill install CoffeeFancy/hermes-proactive-chat
+```
+
+安装过程中会提示输入 DeepSeek API Key 和消息投递目标，自动配置 cron 定时任务。
+
+### 手动安装 / Manual Setup
+
+**依赖 / Dependencies：**
 
 - **Python 3.8+**（只用标准库，零 pip 依赖 / pure stdlib, zero pip deps）
-- **Hermes Agent**（消息投递 / message delivery）
+- **Hermes Agent**（消息投递 / message delivery, [安装 / Install](https://github.com/NousResearch/hermes)）
 - **DeepSeek API Key**（[注册 / Sign up](https://platform.deepseek.com/)）
 
 ### 安装 / Setup
