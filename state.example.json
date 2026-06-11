@@ -3,5 +3,6 @@
   "last_message_time": 0,
   "next_allowed_time": 0,
   "unanswered_count": 0,
-  "last_user_message_time": 0
+  "last_user_message_time": 0,
+  "context_source": "conversation_history"
 }

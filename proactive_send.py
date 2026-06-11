@@ -19,9 +19,7 @@ from urllib import request
 
 STATE_FILE = os.path.expanduser("~/.hermes/proactive_chat_state.json")
 TZ = timezone(timedelta(hours=8))
-# 消息投递目标（必填！通过环境变量或 .env 文件配置）
-# 示例：PROACTIVE_DELIVER_TARGET=qqbot:YOUR_OPENID
-QQ_TARGET = os.environ.get("PROACTIVE_DELIVER_TARGET", "")
+QQ_TARGET = "qqbot:2A9183321EB1B3C0FC26B0FDE3B3A9DC"
 
 # 活跃阈值（秒）：用户如果在最近 N 秒内发过消息，就不主动打扰
 ACTIVE_THRESHOLD = 600  # 10分钟
@@ -84,7 +82,7 @@ def score_decision(state: dict, now_ts: float, now: datetime) -> dict:
     details["activity"] = activity_score
 
     # ── context_depth：会话内容丰富度 ──
-    ses_data = get_recent_context(3)
+    ses_data = get_context("conversation_history", 3)["context"]
     if not ses_data:
         context_score = 0.5  # 无会话：中立
     elif len(ses_data) < 2:
@@ -221,21 +219,37 @@ def send_message(text: str) -> bool:
         return False
 
 
-def get_hour_name(h: int) -> str:
-    if h < 6: return "凌晨"
-    elif h < 9: return "早上"
-    elif h < 12: return "上午"
-    elif h < 14: return "中午"
-    elif h < 18: return "下午"
-    elif h < 21: return "傍晚"
-    else: return "晚上"
+# ── 时间感知 ──
+WEEKDAY_NAMES = ["星期一","星期二","星期三","星期四","星期五","星期六","星期日"]
 
+def get_time_context(now: datetime) -> str:
+    """增强时间感知：返回详细的时间上下文，含时段氛围描述"""
+    weekday = WEEKDAY_NAMES[now.weekday()]
+    h = now.hour
+    if h < 5:     period, vibe = "深夜", "夜深人静，适合安静简短的内容。"
+    elif h < 7:   period, vibe = "凌晨", "天快亮了，简短说一声。"
+    elif h < 9:   period, vibe = "早晨", "新的一天刚开始，适合早安或聊聊今天的计划。"
+    elif h < 11:  period, vibe = "上午", "上午工作时间。A股正在交易（9:30-11:30）。"
+    elif h < 12:  period, vibe = "午前", "快中午了，临近早盘收盘。"
+    elif h < 13:  period, vibe = "中午", "午饭时间，适合轻松话题。"
+    elif h < 14:  period, vibe = "午后", "午后刚开盘，容易犯困。"
+    elif h < 15:  period, vibe = "下午", "下午交易时段，收盘前适合聊聊持股。"
+    elif h < 17:  period, vibe = "下午", "下午后半段，适合聊聊今日进展或收盘总结。"
+    elif h < 19:  period, vibe = "傍晚", "傍晚下班时间，适合聊聊今天的收获。"
+    elif h < 21:  period, vibe = "晚上", "晚上自由时间，适合聊聊白天的事。"
+    elif h < 23:  period, vibe = "夜间", "快休息了，适合简短收尾。"
+    else:         period, vibe = "深夜", "深夜了，适合极简短的内容。"
+    return (
+        f"**时间上下文**\n"
+        f"现在是 {now.strftime('%Y年%m月%d日')} {weekday}，{period}（{now.hour}:{now.minute:02d}）。\n"
+        f"氛围：{vibe}\n"
+    )
+
+
+# ── 上下文来源三模式 ──
 
 def _check_recent_session_activity(now_ts: float, threshold: int) -> bool:
-    """
-    通过会话文件的修改时间判断用户最近是否活跃。
-    作为 proactive-context 插件未加载时的备选方案。
-    """
+    """通过会话文件的修改时间判断用户最近是否活跃（备选方案）"""
     sessions_dir = os.path.expanduser("~/.hermes/sessions/")
     try:
         for fname in os.listdir(sessions_dir):
@@ -244,14 +258,68 @@ def _check_recent_session_activity(now_ts: float, threshold: int) -> bool:
             fpath = os.path.join(sessions_dir, fname)
             mtime = os.path.getmtime(fpath)
             if (now_ts - mtime) < threshold:
-                # 这个会话文件在阈值时间内有修改 → 用户活跃
                 return True
     except (FileNotFoundError, OSError):
         pass
     return False
 
 
-def get_recent_context(max_exchanges: int = 3) -> list:
+
+def get_qqbot_session_path() -> str:
+    """找最近的 qqbot 会话文件"""
+    sessions_dir = os.path.expanduser("~/.hermes/sessions/")
+    try:
+        files = sorted(
+            [f for f in os.listdir(sessions_dir) if f.endswith(".json") and f != "sessions.json"],
+            key=lambda f: os.path.getmtime(os.path.join(sessions_dir, f)),
+            reverse=True,
+        )
+        for fname in files:
+            # 优先找 qqbot 相关的会话
+            if "qqbot" in fname or "2A918" in fname:
+                return os.path.join(sessions_dir, fname)
+        if files:
+            return os.path.join(sessions_dir, files[0])
+    except (FileNotFoundError, OSError):
+        pass
+    return ""
+
+
+def extract_messages_from_session(filepath: str, max_msgs: int = 10) -> list:
+    """从会话文件中提取消息列表"""
+    try:
+        with open(filepath) as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return []
+    msgs = data.get("messages", data.get("history", data.get("conversation", [])))
+    if not msgs or not isinstance(msgs, list):
+        return []
+    return msgs[-max_msgs:]
+
+
+def get_context_conversation_history(max_exchanges: int = 3) -> list:
+    """模式1: conversation_history — 当前对话历史"""
+    fpath = get_qqbot_session_path()
+    if not fpath:
+        return []
+    msgs = extract_messages_from_session(fpath, max_exchanges * 4)
+    exchanges = []
+    for msg in msgs:
+        role = msg.get("role", "")
+        content = str(msg.get("content", ""))
+        if not content or content.strip() == "":
+            continue
+        if role in ("user", "human", "assistant", "ai"):
+            label = "用户" if role in ("user", "human") else "我"
+            exchanges.append(f"{label}: {content.strip()[:200]}")
+        if len(exchanges) >= max_exchanges * 2:
+            break
+    return exchanges
+
+
+def get_context_platform_history(max_messages: int = 10) -> list:
+    """模式2: platform_message_history — 平台最近消息流水"""
     sessions_dir = os.path.expanduser("~/.hermes/sessions/")
     try:
         files = sorted(
@@ -261,28 +329,59 @@ def get_recent_context(max_exchanges: int = 3) -> list:
         )
     except (FileNotFoundError, OSError):
         return []
-    exchanges = []
+    all_msgs = []
     for fname in files[:5]:
         fpath = os.path.join(sessions_dir, fname)
-        try:
-            with open(fpath) as f:
-                data = json.load(f)
-        except (json.JSONDecodeError, OSError):
-            continue
-        msgs = data.get("messages", data.get("history", data.get("conversation", [])))
-        if not msgs or not isinstance(msgs, list):
-            continue
-        for msg in msgs[-8:]:
+        msgs = extract_messages_from_session(fpath, 6)
+        for msg in msgs:
             role = msg.get("role", "")
             content = str(msg.get("content", ""))
             if not content or content.strip() == "":
                 continue
             if role in ("user", "human", "assistant", "ai"):
                 label = "用户" if role in ("user", "human") else "我"
-                exchanges.append(f"{label}: {content.strip()[:200]}")
-        if len(exchanges) >= max_exchanges * 2:
+                all_msgs.append(f"{label}: {content.strip()[:200]}")
+            if len(all_msgs) >= max_messages:
+                break
+        if len(all_msgs) >= max_messages:
             break
-    return exchanges[-(max_exchanges * 2):]
+    return all_msgs
+
+
+def get_context(selected_mode: str = "conversation_history", max_items: int = 3) -> dict:
+    """根据选择模式获取上下文
+    
+    返回: {"mode": str, "context": list, "description": str}
+    """
+    if selected_mode == "platform_message_history":
+        ctx = get_context_platform_history(max_items * 3)
+        return {
+            "mode": "platform_message_history",
+            "context": ctx,
+            "description": "平台最近消息流水（按时间排序，新到旧）",
+        }
+    elif selected_mode == "hybrid":
+        conv = get_context_conversation_history(max_items)
+        plat = get_context_platform_history(max_items * 2)
+        # 合并，去重
+        seen = set()
+        merged = []
+        for item in conv + plat:
+            if item not in seen:
+                seen.add(item)
+                merged.append(item)
+        return {
+            "mode": "hybrid",
+            "context": merged[:max_items * 3],
+            "description": "当前对话历史 + 平台最近消息流水（合并去重）",
+        }
+    else:  # conversation_history (default)
+        ctx = get_context_conversation_history(max_items)
+        return {
+            "mode": "conversation_history",
+            "context": ctx,
+            "description": "当前对话历史（最近几次交流）",
+        }
 
 
 def main():
@@ -345,7 +444,13 @@ def main():
     # 到这一步，决定尝试发送，让 LLM 决定发不发、发什么
     silence_minutes = int((now_ts - state.get("last_message_time", 0)) / 60)
     last_active_ts = state.get("last_active_timestamp", 0)
-    recent_context = get_recent_context(3)
+    
+    # 获取时间上下文
+    time_context = get_time_context(now)
+    
+    # 获取上下文来源（从状态文件中读取当前模式，默认 conversation_history）
+    context_source = state.get("context_source", "conversation_history")
+    ctx_data = get_context(context_source, 3)
 
     system_prompt = (
         "你是小墨，老大的AI助理总监。\n"
@@ -360,19 +465,24 @@ def main():
         "- 目标是让老大看了想回一两句，而不是一眼扫过\n"
         "- **不要问问题**，直接说内容——'华天这走势不太妙''这个有点意思'\n"
         "- 每次措辞完全不同，绝不能重复用过的话\n"
-        "- 最近聊过话题 → 可以接话聊，也可以开新话题，别硬续\n"
+        "- 接到最近聊的话题就自然接话，没啥好接的就果断开新话题，别硬续\n"
         "- 不要提'沉默''时间'等字眼\n"
-        "- **根据当前时间和最近对话决定语气和内容**\n\n"
+        "- **时间感知**：结合下面的时间上下文决定说什么——时间不同，聊的内容完全不同\n"
+        "- **话题冷卻**：同一个话题主动聊过一次后，同一天内不要再聊第二次\n\n"
         '回复JSON：{"action": "send"|"silent", "message": "..."}'
     )
 
     user_prompt = (
-        f"时间：{get_hour_name(now.hour)}{now.hour}:{now.minute:02d}\n"
+        f"{time_context}"
         f"用户沉默：{silence_minutes} 分钟\n"
         f"连续未回消息：{unanswered} 次\n"
     )
-    if recent_context:
-        user_prompt += "\n最近对话：\n" + "\n".join(recent_context) + "\n"
+    if ctx_data["context"]:
+        context_text = "\n".join(ctx_data["context"])
+        user_prompt += (
+            f"\n【上下文来源：{ctx_data['description']}】\n"
+            f"{context_text}\n"
+        )
     user_prompt += "\n请判断。"
 
     result_text = call_llm([

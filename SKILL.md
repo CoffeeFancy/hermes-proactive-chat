@@ -37,6 +37,9 @@ AI 主动对话插件，让 Hermes Agent 学会主动找用户聊天。
 
 ## 手动管理
 
+- **切换上下文模式**：编辑 `~/.hermes/proactive_chat_state.json`，修改 `context_source` 字段为 `"conversation_history"` / `"platform_message_history"` / `"hybrid"` 之一
+- 默认 `conversation_history`，切换为 `hybrid` 可减少话题重复
+
 ```bash
 # 查看状态
 cat ~/.hermes/proactive_chat_state.json

@@ -56,11 +56,15 @@ A human-like conversation should go both ways:
              发送
 ```
 
-### 核心机制：6 维权重决策 / Core Mechanism
+### 核心机制：6 维权重决策 + 时间感知 + 上下文三模式 / Core Mechanism
 
 > **多维度评分，纯数学计算决定"发不发"，LLM 只负责"发什么"。**
 >
 > **Multi-dimension scoring: pure math decides IF to send, LLM only decides WHAT.**
+
+- **时间感知**：LLM 决策时注入星期、时段、氛围描述，让消息内容因时因地自然切换
+- **上下文三模式**：可选 `conversation_history`（当前对话）、`platform_message_history`（平台流水）、`hybrid`（混合），避免重复聊同一话题
+- **话题冷却**：同一天内主动聊过的话题不再聊第二次
 
 大部分 tick 在评分阶段就被筛掉，不调 LLM，节省 token。
 
@@ -137,6 +141,8 @@ crontab -e
 | `PROACTIVE_ACTIVE_THRESHOLD` | `600` | 用户活跃阈值（秒）/ Active threshold (s) |
 | `PROACTIVE_QUIET_START` | `1380` | 安静时段开始 / Quiet hours start |
 | `PROACTIVE_QUIET_END` | `450` | 安静时段结束 / Quiet hours end |
+| `PROACTIVE_CONTEXT_SOURCE` | `conversation_history` | 上下文来源模式 / Context source mode (`conversation_history` / `platform_message_history` / `hybrid`) |
+| `PROACTIVE_STATE_FILE` | `~/.hermes/proactive_chat_state.json` | 状态文件路径 / State file path |
 
 ---
 
@@ -150,6 +156,7 @@ crontab -e
   "last_message_time": 1749600000.0,
   "next_allowed_time": 1749603600.0,
   "unanswered_count": 0,
+  "context_source": "conversation_history",
   "last_user_message_time": 1749600000.0,
   "last_active_message": "华天这走势不太妙",
   "last_active_timestamp": 1749600000.0
@@ -187,7 +194,10 @@ SYSTEM_PROMPT = (
 
 This project draws the proactive chat scheduling and LLM decision-making pattern from [**Open-LLM-VTuber**](https://github.com/Open-LLM-VTuber/Open-LLM-VTuber), and is adapted from [**AllenReder**](https://github.com/AllenReder)'s [**hermes-active-message**](https://github.com/AllenReder/hermes-active-message).
 
-此外还使用了/Also uses:
+**v3.5 灵感来源 / v3.5 Inspiration：**
+- [**astrbot_plugin_proactive_chat**](https://github.com/DBJD-CR/astrbot_plugin_proactive_chat) by DBJD-CR — 时间感知和上下文三模式的设计参考了此 AstrBot 插件的思路
+
+此外还使用了/Also uses：
 - [Hermes Agent](https://github.com/NousResearch/hermes) — 消息投递与调度 / Message delivery & scheduling
 - QQ Bot / OpenClaw — 消息收发底层协议 / Messaging protocol layer
 
