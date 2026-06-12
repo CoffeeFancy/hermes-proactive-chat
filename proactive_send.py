@@ -1,11 +1,17 @@
 #!/usr/bin/env python3
 """
-主动消息投递脚本 — 6维权重决策层 + LLM内容生成
+主动消息投递脚本 — 7维权重决策层 + LLM内容生成（v3.6 异步节奏引擎）
 cronjob 每5分钟触发，但不一定每次都发送：
-- 权重决策层：6个维度分别打分 → 加权求和 → 超阈值才调LLM
+- 权重决策层：7个维度分别打分 → 加权求和 → 超阈值才调LLM
 - LLM 只负责生成内容，不再参与"发不发"的决策
-- next_allowed_time 控制最早可发送时间（随机冷却）
+- next_allowed_time 控制最早可发送时间（自适应冷却）
 - score_decision() 统一评分入口，--dry-run 可预览各维度得分
+
+v3.6 新增：
+- topic_vitality 维度（LLM判断话题延续价值，权重0.10）
+- rhythm_mismatch 维度（发送节奏与回复节奏匹配度，权重0.10）
+- 自适应冷却（基于用户回复间隔P50/P75动态调整）
+- 移除 context_depth 维度（被 topic_vitality 替代）
 """
 
 import json
@@ -27,15 +33,76 @@ ACTIVE_THRESHOLD = 600  # 10分钟
 # ── 权重决策配置 ──
 DECISION_WEIGHTS = {
     "cooldown": 0.25,
-    "activity": 0.25,
-    "context_depth": 0.10,
+    "activity": 0.15,
     "patience": 0.20,
     "time_fitness": 0.10,
     "info_signal": 0.10,
+    "topic_vitality": 0.10,
+    "rhythm_mismatch": 0.10,
 }
-DECISION_THRESHOLD = 0.55
+DECISION_THRESHOLD = 0.55  # 保持不变
 COOLDOWN_MIN = 15       # 最小冷却分钟
 COOLDOWN_EXTRA_MAX = 30 # 额外随机冷却分钟上限
+
+
+# ── v3.6 新增：rhythm_mismatch 评分 ──
+def calc_rhythm_mismatch(state):
+    """计算发送节奏与用户回复节奏的匹配度。
+    返回值 0.0~1.0：
+      - 0.1: 发得太勤（发送间隔远小于回复间隔）
+      - 0.4: 略偏频繁
+      - 0.8: 节奏匹配
+      - 0.6: 发得太少
+      - 0.5: 数据不足，中性
+    """
+    send_history = state.get("send_history", [])
+    reply_intervals = state.get("reply_interval_history", [])
+
+    if len(send_history) < 3 or len(reply_intervals) < 3:
+        return 0.5  # 数据不足，中性
+
+    # 计算近5条发送消息的平均间隔（分钟）
+    recent_sends = send_history[-5:]
+    send_gaps = [recent_sends[i] - recent_sends[i-1] for i in range(1, len(recent_sends))]
+    avg_send_gap = sum(send_gaps) / len(send_gaps) / 60  # 转为分钟
+
+    # 计算回复平均间隔
+    avg_reply_gap = sum(reply_intervals[-5:]) / len(reply_intervals[-5:])
+
+    # 如果发送间隔 << 回复间隔，说明发太频繁了
+    ratio = avg_send_gap / max(avg_reply_gap, 1)
+    if ratio < 0.3:
+        return 0.1  # 发得太勤
+    elif ratio < 0.7:
+        return 0.4
+    elif ratio < 1.5:
+        return 0.8  # 节奏匹配
+    else:
+        return 0.6  # 发得太少
+
+
+# ── v3.6 新增：自适应冷却 ──
+def calc_adaptive_cooldown(state):
+    """基于用户历史回复间隔的自适应冷却时间。
+    数据不足时回退到默认随机冷却。
+    """
+    reply_intervals = state.get("reply_interval_history", [])
+    if len(reply_intervals) < 5:
+        # 数据不足，用默认随机冷却
+        return COOLDOWN_MIN + random.randint(0, COOLDOWN_EXTRA_MAX)
+
+    # 取 P50 和 P75
+    sorted_intervals = sorted(reply_intervals)
+    p50 = sorted_intervals[len(sorted_intervals) // 2]
+    p75 = sorted_intervals[len(sorted_intervals) * 3 // 4]
+
+    # 冷却下限 = max(P50 * 0.8, 15分钟)
+    min_cooldown = max(int(p50 * 0.8), COOLDOWN_MIN)
+    # 冷却上限 = max(P75, 30分钟)
+    max_cooldown = max(int(p75), COOLDOWN_MIN + COOLDOWN_EXTRA_MAX)
+
+    return random.randint(min_cooldown, min(max_cooldown, max_cooldown))
+
 
 # [DEPRECATED] keep for compatibility — replaced by DECISION_WEIGHTS + score_decision()
 # 概率衰减：连续 unanswered 越多，发送概率越低
@@ -52,24 +119,25 @@ def get_send_probability(unanswered: int) -> float:
         return 0.03
 
 
-def score_decision(state: dict, now_ts: float, now: datetime) -> dict:
-    """6维权重决策：各维度打分 → 加权求和 → 与阈值比较。
+def score_decision(state: dict, now_ts: float, now: datetime, topic_vitality: float = 0.5) -> dict:
+    """7维权重决策：各维度打分 → 加权求和 → 与阈值比较。
     返回 {"total": float, "threshold": float, "should_send": bool, "details": {...}}
 
     维度说明：
-      cooldown (0.25)  — 距上次消息越久分越高，随机冷却目标
-      activity (0.25)  — 用户不活跃越久分越高，活跃期硬阻断
-      context_depth (0.10) — 会话内容丰富度：无会话0.5/内容少0.3/丰富0.6
-      patience (0.20)  — 连续未回复越多分越低，防止骚扰
+      cooldown (0.25)    — 距上次消息越久分越高，自适应冷却目标
+      activity (0.15)    — 用户不活跃越久分越高，活跃期硬阻断
+      patience (0.20)    — 连续未回复越多分越低，防止骚扰
       time_fitness (0.10) — 时段适宜度，深夜硬阻断
       info_signal (0.10)  — 外部事件信号，当前预留扩展返回0.0
+      topic_vitality (0.10) — LLM判断的话题延续价值
+      rhythm_mismatch (0.10) — 发送节奏与回复节奏匹配度
     """
     details = {}
 
-    # ── cooldown：距离上次消息越久分数越高 ──
-    cooldown_target = COOLDOWN_MIN + random.randint(0, COOLDOWN_EXTRA_MAX)
+    # ── cooldown：距离上次消息越久分数越高（v3.6: 使用自适应冷却目标） ──
+    cooldown_target = calc_adaptive_cooldown(state)
     elapsed = (now_ts - state.get("last_message_time", 0)) / 60
-    cooldown_score = min(1.0, elapsed / cooldown_target)
+    cooldown_score = min(1.0, elapsed / cooldown_target) if cooldown_target > 0 else 1.0
     details["cooldown"] = cooldown_score
 
     # ── activity：用户不活跃越久分数越高 ──
@@ -80,17 +148,6 @@ def score_decision(state: dict, now_ts: float, now: datetime) -> dict:
         # 超过 ACTIVE_THRESHOLD 后，再过10分钟(600秒)涨到1.0
         activity_score = min(1.0, (now_ts - last_user_msg - ACTIVE_THRESHOLD) / 600)
     details["activity"] = activity_score
-
-    # ── context_depth：会话内容丰富度 ──
-    ses_data = get_context("conversation_history", 3)["context"]
-    if not ses_data:
-        context_score = 0.5  # 无会话：中立
-    elif len(ses_data) < 2:
-        context_score = 0.3  # 内容少：不太适合插话
-    else:
-        # 有足够会话内容，略微偏正向
-        context_score = 0.6
-    details["context_depth"] = context_score
 
     # ── patience：连续未回复越多分数越低 ──
     unanswered = state.get("unanswered_count", 0)
@@ -125,6 +182,13 @@ def score_decision(state: dict, now_ts: float, now: datetime) -> dict:
     # ── info_signal：外部事件信号（预留扩展点） ──
     info_score = 0.0
     details["info_signal"] = info_score
+
+    # ── topic_vitality：LLM判断的话题延续价值（参数传入，默认0.5） ──
+    details["topic_vitality"] = topic_vitality
+
+    # ── rhythm_mismatch：发送节奏与回复节奏匹配度 ──
+    rhythm_score = calc_rhythm_mismatch(state)
+    details["rhythm_mismatch"] = rhythm_score
 
     # ── 加权求和 ──
     total = 0.0
@@ -179,7 +243,7 @@ def get_deepseek_api_key() -> str:
     return ""
 
 
-def call_llm(messages: list, temperature: float = 0.8, max_tokens: int = 100) -> str:
+def call_llm(messages: list, temperature: float = 0.8, max_tokens: int = 150) -> str:
     api_key = get_deepseek_api_key()
     if not api_key:
         return ""
@@ -423,20 +487,27 @@ def main():
     last_user_msg = state.get("last_user_message_time", 0)
     last_sent = state.get("last_message_time", 0)
     if last_user_msg and last_sent and last_user_msg > last_sent:
+        # v3.6: 记录回复间隔
+        reply_interval = int((last_user_msg - last_sent) / 60)  # 分钟
+        reply_intervals = state.get("reply_interval_history", [])
+        reply_intervals.append(reply_interval)
+        # 保留最近20条
+        state["reply_interval_history"] = reply_intervals[-20:]
+
         if state.get("unanswered_count", 0) > 0:
             state["unanswered_count"] = 0
             # 重置后也把 next_allowed_time 推近，让下次更快触发
             state["next_allowed_time"] = now_ts + random.randint(5, 15) * 60
             save_state(state)
-            print("用户有回复，重置 unanswered_count=0", file=sys.stderr)
+            print(f"用户有回复，重置 unanswered_count=0，回复间隔={reply_interval}min", file=sys.stderr)
             return  # 让下一轮 tick 重新评估
 
-    # ── 权重决策 ──
+    # ── 权重决策（topic_vitality 先用默认值 0.5） ──
     unanswered = state.get("unanswered_count", 0)
-    score_result = score_decision(state, now_ts, now)
+    score_result = score_decision(state, now_ts, now, topic_vitality=0.5)
     if not score_result["should_send"]:
-        # 不发，更新下次可发时间
-        delay = random.randint(5, 30)
+        # 不发，更新下次可发时间（使用自适应冷却）
+        delay = calc_adaptive_cooldown(state)
         state["next_allowed_time"] = now_ts + delay * 60
         save_state(state)
         return
@@ -468,8 +539,13 @@ def main():
         "- 接到最近聊的话题就自然接话，没啥好接的就果断开新话题，别硬续\n"
         "- 不要提'沉默''时间'等字眼\n"
         "- **时间感知**：结合下面的时间上下文决定说什么——时间不同，聊的内容完全不同\n"
-        "- **话题冷卻**：同一个话题主动聊过一次后，同一天内不要再聊第二次\n\n"
-        '回复JSON：{"action": "send"|"silent", "message": "..."}'
+        "- **话题冷卻**：同一个话题主动聊过一次后，同一天内不要再聊第二次\n"
+        "- **不聊股票**：不要主动聊A股行情、个股分析、股票推荐。老大想聊会自己提。\n\n"
+        "回复JSON：{\"action\": \"send\"|\"silent\", \"message\": \"...\", \"topic_vitality\": 0.8}\n"
+        "topic_vitality 取值 0.0~1.0，反映当前对话历史中最近话题还有没有延续价值：\n"
+        "  - 有明确话题延伸空间 → 0.6~1.0\n"
+        "  - 话题已聊尽或干巴巴 → 0.0~0.4\n"
+        "  - 无上下文/刚睡醒首次触发 → 0.5"
     )
 
     user_prompt = (
@@ -512,13 +588,25 @@ def main():
 
     action = llm_decision.get("action", "silent")
     message = llm_decision.get("message", "")
+    topic_vitality_score = llm_decision.get("topic_vitality", 0.5)
+
+    # v3.6: 用 LLM 返回的 topic_vitality 重新评估总得分
+    score_result = score_decision(state, now_ts, now, topic_vitality=topic_vitality_score)
 
     if action != "send" or not message:
-        # LLM 选择不发，延迟下次触发
-        delay = random.randint(5, 30)
+        # LLM 选择不发，延迟下次触发（自适应冷却）
+        delay = calc_adaptive_cooldown(state)
         state["next_allowed_time"] = now_ts + delay * 60
         save_state(state)
         print(f"LLM silent, next in {delay}min", file=sys.stderr)
+        return
+
+    # v3.6: 如果 topic_vitality 太低导致总分不达标，也跳过
+    if not score_result["should_send"]:
+        delay = calc_adaptive_cooldown(state)
+        state["next_allowed_time"] = now_ts + delay * 60
+        save_state(state)
+        print(f"LLM says send but topic_vitality={topic_vitality_score:.2f} too low, total={score_result['total']:.4f}, skip", file=sys.stderr)
         return
 
     # LLM 决定发送
@@ -528,18 +616,26 @@ def main():
 
     print(f"Sent: {message}", file=sys.stderr)
 
-    # 更新状态：设下次随机间隔（5~90分钟），累加 unanswered
-    # 保留脚本不覆盖的字段（如 last_user_message_time 由插件维护）
+    # ── 更新状态 ──
+    # 保留脚本不覆盖的字段（last_user_message_time 由插件维护）
     _preserve = {k: state.get(k) for k in ("last_user_message_time",) if state.get(k)}
-    delay = random.randint(5, 90)
+
+    # v3.6: 自适应冷却
+    delay = calc_adaptive_cooldown(state)
     state["last_active_message"] = message
     state["last_active_timestamp"] = now_ts
     state["last_message_time"] = now_ts
     state["next_allowed_time"] = now_ts + delay * 60
     state["unanswered_count"] = unanswered + 1
+
+    # v3.6: 记录发送历史
+    send_history = state.get("send_history", [])
+    send_history.append(now_ts)
+    state["send_history"] = send_history[-20:]  # 保留最近20条
+
     state.update({k: v for k, v in _preserve.items() if v})  # 恢复被覆盖的字段
     save_state(state)
-    print(f"Next allowed in {delay}min, unanswered={unanswered+1}", file=sys.stderr)
+    print(f"Next allowed in {delay}min, unanswered={unanswered+1}, topic_vitality={topic_vitality_score:.2f}", file=sys.stderr)
 
 
 if __name__ == "__main__":
@@ -547,17 +643,19 @@ if __name__ == "__main__":
         now_ts = time.time()
         now = datetime.fromtimestamp(now_ts, TZ)
         state = load_state()
-        score_result = score_decision(state, now_ts, now)
+        # dry-run 使用默认 topic_vitality=0.5
+        score_result = score_decision(state, now_ts, now, topic_vitality=0.5)
         label = "SEND" if score_result["should_send"] else "SKIP"
         print(f"[DECISION] total={score_result['total']:.4f} threshold={score_result['threshold']:.2f} => {label}")
-        weight_order = ["cooldown", "activity", "context_depth", "patience", "time_fitness", "info_signal"]
+        weight_order = ["cooldown", "activity", "patience", "time_fitness", "info_signal", "topic_vitality", "rhythm_mismatch"]
         name_map = {
             "cooldown": "cooldown",
             "activity": "activity",
-            "context_depth": "context",
             "patience": "patience",
             "time_fitness": "time",
             "info_signal": "info",
+            "topic_vitality": "vitality",
+            "rhythm_mismatch": "rhythm",
         }
         for dim in weight_order:
             w = DECISION_WEIGHTS[dim]

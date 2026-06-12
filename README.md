@@ -31,19 +31,20 @@ A human-like conversation should go both ways:
   │
   ├─ 安静时段？         → 跳过（默认 23:00~07:30）
   ├─ Quiet hours?       → Skip
-  ├─ 还在冷却期？        → 跳过（发完后随机冷却 15~45 分钟）
-  ├─ Still cooling down? → Skip (random 15~45 min cooldown)
+  ├─ 还在冷却期？        → 跳过（自适应冷却：基于回复节奏动态调整）
+  ├─ Still cooling down? → Skip (adaptive cooldown based on reply rhythm)
   ├─ 用户最近有消息？     → 跳过（不打扰正在聊天的用户）
   ├─ User recently active? → Skip (don't interrupt)
   │
-  └─ 6 维权重决策 / 6-Dimension Weighted Decision
+  └─ 7 维权重决策 / 7-Dimension Weighted Decision
        ┌─────────────────────────────────────────────┐
        │ 冷却因子  × 0.25  上次发送后过了多久         │
-       │ 活跃因子  × 0.25  用户沉默了多久             │
+       │ 活跃因子  × 0.15  用户沉默了多久             │
        │ 耐心衰减  × 0.20  连续未回复了几次           │
-       │ 语境深度  × 0.10  会话话题是否丰富           │
        │ 时间适宜  × 0.10  当前时段是否适合说话       │
        │ 信息信号  × 0.10  预留扩展（新闻/股价等）   │
+       │ 话题活力  × 0.10  LLM评估话题有无延续价值 ✨ │
+       │ 节奏匹配  × 0.10  发送节奏vs回复节奏 ✨      │
        └───────────────┬─────────────────────────────┘
                        │
                    总分 ≥ 0.55？
@@ -56,15 +57,22 @@ A human-like conversation should go both ways:
              发送
 ```
 
-### 核心机制：6 维权重决策 + 时间感知 + 上下文三模式 / Core Mechanism
+### 核心机制：7 维权重决策 + 时间感知 + 自适应冷却 / Core Mechanism
 
 > **多维度评分，纯数学计算决定"发不发"，LLM 只负责"发什么"。**
 >
 > **Multi-dimension scoring: pure math decides IF to send, LLM only decides WHAT.**
 
+- **v3.6 异步节奏引擎 ✨**：新增两个维度——**话题活力**（LLM 评估当前话题有无延续价值）和**节奏匹配**（比较发送节奏 vs 回复节奏），替换原来的"语境深度"维度
+- **v3.6 Async Rhythm Engine ✨**: Two new dimensions — **Topic Vitality** (LLM evaluates if the current topic is worth continuing) and **Rhythm Match** (compares send frequency vs reply frequency), replacing the old "context depth" dimension
+- **自适应冷却**：不再用固定随机冷却，而是根据用户的回复间隔 P50/P75 动态调整冷却时间，节奏自然对齐
+- **Adaptive Cooldown**: Replaces fixed random cooldown with dynamic adjustment based on the user's reply interval P50/P75, naturally matching your conversation rhythm
 - **时间感知**：LLM 决策时注入星期、时段、氛围描述，让消息内容因时因地自然切换
+- **Time Awareness**: Injects day-of-week, time period, and contextual atmosphere into LLM decisions, making messages naturally match the time of day
 - **上下文三模式**：可选 `conversation_history`（当前对话）、`platform_message_history`（平台流水）、`hybrid`（混合），避免重复聊同一话题
+- **Three Context Modes**: Choose from `conversation_history` (current session), `platform_message_history` (platform-wide feed), or `hybrid` (merged), avoiding repetitive topics
 - **话题冷却**：同一天内主动聊过的话题不再聊第二次
+- **Topic Cooldown**: Topics initiated once won't be revisited the same day
 
 大部分 tick 在评分阶段就被筛掉，不调 LLM，节省 token。
 
@@ -78,12 +86,13 @@ python3 proactive_send.py --dry-run
 
 # 输出示例 / Example output
 # [DECISION] total=0.64 threshold=0.55 => SEND
-#   cooldown:  0.25 * 1.00  = 0.2500
-#   activity:  0.25 * 0.80  = 0.2000
-#   context:   0.10 * 0.60  = 0.0600
+#   cooldown:  0.25 * 0.91  = 0.2275
+#   activity:  0.15 * 0.80  = 0.1200
 #   patience:  0.20 * 0.70  = 0.1400
 #   time:      0.10 * 0.60  = 0.0600
 #   info:      0.10 * 0.00  = 0.0000
+#   vitality:  0.10 * 0.70  = 0.0700  ✨
+#   rhythm:    0.10 * 0.80  = 0.0800  ✨
 ```
 
 ---
@@ -158,10 +167,14 @@ crontab -e
   "unanswered_count": 0,
   "context_source": "conversation_history",
   "last_user_message_time": 1749600000.0,
-  "last_active_message": "华天这走势不太妙",
-  "last_active_timestamp": 1749600000.0
+  "last_active_message": "这代码写的太烂了",
+  "last_active_timestamp": 1749600000.0,
+  "send_history": [1749600000.0, 1749603600.0],
+  "reply_interval_history": [45, 120, 30]
 }
 ```
+
+`send_history` 和 `reply_interval_history` 由脚本自动维护，用于自适应冷却计算。
 
 ---
 
@@ -193,6 +206,10 @@ SYSTEM_PROMPT = (
 本项目源自 [**Open-LLM-VTuber**](https://github.com/Open-LLM-VTuber/Open-LLM-VTuber) 项目，摘取了其中的主动对话调度思路和 LLM 自主决策模式，并参考了 [**AllenReder**](https://github.com/AllenReder) 的 [**hermes-active-message**](https://github.com/AllenReder/hermes-active-message) 项目改造而来。
 
 This project draws the proactive chat scheduling and LLM decision-making pattern from [**Open-LLM-VTuber**](https://github.com/Open-LLM-VTuber/Open-LLM-VTuber), and is adapted from [**AllenReder**](https://github.com/AllenReder)'s [**hermes-active-message**](https://github.com/AllenReder/hermes-active-message).
+
+**v3.6 异步节奏引擎灵感 / v3.6 Asynchronous Rhythm Engine Inspiration：**
+- [**Time to Talk: LLM Agents for Asynchronous Group Communication in Mafia Games**](https://niveck.github.io/Time-to-Talk/) (arXiv 2506.05309) — 异步LLM Agent的"什么时候说"决策机制，启发了话题活力评分和节奏匹配维度 / Asynchronous LLM agent "when to speak" decision mechanism, inspired topic vitality scoring and rhythm matching
+- [**Beyond Turn-taking: Introducing Text-based Overlap into Human-LLM Interactions**](https://arxiv.org/abs/2501.18103) (arXiv 2501.18103) — 打破一问一答轮次模式，启发了节奏自适应冷却设计 / Breaking the turn-taking paradigm, inspired adaptive cooldown design
 
 **v3.5 灵感来源 / v3.5 Inspiration：**
 - [**astrbot_plugin_proactive_chat**](https://github.com/DBJD-CR/astrbot_plugin_proactive_chat) by DBJD-CR — 时间感知和上下文三模式的设计参考了此 AstrBot 插件的思路
