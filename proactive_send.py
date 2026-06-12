@@ -82,7 +82,7 @@ def calc_rhythm_mismatch(state):
 
 
 # ── v3.6 新增：自适应冷却 ──
-def calc_adaptive_cooldown(state):
+def calc_adaptive_cooldown(state, deterministic=False):
     """基于用户历史回复间隔的自适应冷却时间。
     数据不足时回退到默认随机冷却。
     """
@@ -101,7 +101,10 @@ def calc_adaptive_cooldown(state):
     # 冷却上限 = max(P75, 30分钟)
     max_cooldown = max(int(p75), COOLDOWN_MIN + COOLDOWN_EXTRA_MAX)
 
-    return random.randint(min_cooldown, min(max_cooldown, max_cooldown))
+    if deterministic:
+        return min_cooldown  # dry-run 模式返回确定性值
+
+    return random.randint(min_cooldown, max_cooldown)
 
 
 # [DEPRECATED] keep for compatibility — replaced by DECISION_WEIGHTS + score_decision()
@@ -119,7 +122,7 @@ def get_send_probability(unanswered: int) -> float:
         return 0.03
 
 
-def score_decision(state: dict, now_ts: float, now: datetime, topic_vitality: float = 0.5) -> dict:
+def score_decision(state: dict, now_ts: float, now: datetime, topic_vitality: float = 0.5, dry_run: bool = False) -> dict:
     """7维权重决策：各维度打分 → 加权求和 → 与阈值比较。
     返回 {"total": float, "threshold": float, "should_send": bool, "details": {...}}
 
@@ -135,7 +138,7 @@ def score_decision(state: dict, now_ts: float, now: datetime, topic_vitality: fl
     details = {}
 
     # ── cooldown：距离上次消息越久分数越高（v3.6: 使用自适应冷却目标） ──
-    cooldown_target = calc_adaptive_cooldown(state)
+    cooldown_target = calc_adaptive_cooldown(state, deterministic=dry_run)
     elapsed = (now_ts - state.get("last_message_time", 0)) / 60
     cooldown_score = min(1.0, elapsed / cooldown_target) if cooldown_target > 0 else 1.0
     details["cooldown"] = cooldown_score
@@ -487,12 +490,15 @@ def main():
     last_user_msg = state.get("last_user_message_time", 0)
     last_sent = state.get("last_message_time", 0)
     if last_user_msg and last_sent and last_user_msg > last_sent:
-        # v3.6: 记录回复间隔
+        # v3.6: 记录回复间隔（去重：避免同一时间戳重复追加）
         reply_interval = int((last_user_msg - last_sent) / 60)  # 分钟
-        reply_intervals = state.get("reply_interval_history", [])
-        reply_intervals.append(reply_interval)
-        # 保留最近20条
-        state["reply_interval_history"] = reply_intervals[-20:]
+        last_recorded = state.get("last_reply_recorded_ts", 0)
+        if last_user_msg != last_recorded:
+            reply_intervals = state.get("reply_interval_history", [])
+            reply_intervals.append(reply_interval)
+            # 保留最近20条
+            state["reply_interval_history"] = reply_intervals[-20:]
+            state["last_reply_recorded_ts"] = last_user_msg
 
         if state.get("unanswered_count", 0) > 0:
             state["unanswered_count"] = 0
@@ -644,7 +650,7 @@ if __name__ == "__main__":
         now = datetime.fromtimestamp(now_ts, TZ)
         state = load_state()
         # dry-run 使用默认 topic_vitality=0.5
-        score_result = score_decision(state, now_ts, now, topic_vitality=0.5)
+        score_result = score_decision(state, now_ts, now, topic_vitality=0.5, dry_run=True)
         label = "SEND" if score_result["should_send"] else "SKIP"
         print(f"[DECISION] total={score_result['total']:.4f} threshold={score_result['threshold']:.2f} => {label}")
         weight_order = ["cooldown", "activity", "patience", "time_fitness", "info_signal", "topic_vitality", "rhythm_mismatch"]
